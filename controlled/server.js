@@ -3,59 +3,115 @@ const app = express();
 const server = require('http').createServer(app);
 const io = require('socket.io-client');
 const { spawn } = require('child_process');
+const os = require('os');
 
-let robot;
-let psProcess;
+// Start a persistent PowerShell process for better performancep
+const psProcess = spawn('powershell.exe', ['-NoProfile', '-Command', '-'], {
+  stdio: ['pipe', 'pipe', 'pipe']
+});
 
-try {
-  robot = require('robotjs');
-  console.log('robotjs loaded successfully');
-} catch (e) {
-  console.log('robotjs not available, using PowerShell fallback');
+// Movement batching for ultra-low latency mouse control
+let pendingMovements = [];
+let movementTimer = null;
+const MOVEMENT_BATCH_DELAY = 2; // Ultra-low latency: 2ms (~500fps processing)
 
-  // Start a persistent PowerShell process for better performance
-  psProcess = spawn('powershell.exe', ['-NoProfile', '-Command', '-'], {
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
+psProcess.stdout.on('data', (data) => {
+  console.log('PowerShell output:', data.toString());
+});
 
-  psProcess.stdout.on('data', (data) => {
-    console.log('PowerShell output:', data.toString());
-  });
+psProcess.stderr.on('data', (data) => {
+  console.log('PowerShell error:', data.toString());
+});
 
-  psProcess.stderr.on('data', (data) => {
-    console.log('PowerShell error:', data.toString());
-  });
+// Send initial setup commands with optimized cursor settings
+psProcess.stdin.write('Add-Type -AssemblyName System.Windows.Forms\n');
+psProcess.stdin.write('Add-Type -AssemblyName System.Drawing\n');
+psProcess.stdin.write(`
+# Set high-performance cursor movement using simplified Win32 API
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
 
-  // Send initial setup commands
-  psProcess.stdin.write('Add-Type -AssemblyName System.Windows.Forms\n');
-  psProcess.stdin.write('Add-Type -AssemblyName System.Drawing\n');
+public struct POINT {
+    public int X;
+    public int Y;
+}
 
-  robot = {
-    getScreenSize: () => ({ width: 1920, height: 1080 }),
-    moveMouse: (deltaX, deltaY) => {
-      const cmd = `
-        $currentPos = [System.Windows.Forms.Cursor]::Position
-        $newX = [Math]::Max(0, [Math]::Min(1919, ($currentPos.X + ${Math.round(deltaX * 3)})))
-        $newY = [Math]::Max(0, [Math]::Min(1079, ($currentPos.Y + ${Math.round(deltaY * 3)})))
-        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($newX, $newY)
-        Write-Host "Moved to: $newX, $newY"
-      `;
-      try {
-        psProcess.stdin.write(cmd + '\n');
-        console.log(`Moving mouse by delta: ${deltaX}, ${deltaY}`);
-      } catch (error) {
-        console.log('Error writing to PowerShell stdin:', error);
-      }
-    },
-    mouseClick: (button) => {
-      console.log(`Attempting mouse click: ${button}`);
-      const isLeft = button === 'left';
-      const downFlag = isLeft ? 0x0002 : 0x0008;  // LEFTDOWN or RIGHTDOWN
-      const upFlag = isLeft ? 0x0004 : 0x0010;    // LEFTUP or RIGHTUP
+public class Win32Cursor {
+    [DllImport("user32.dll")]
+    public static extern bool SetCursorPos(int X, int Y);
+    
+    [DllImport("user32.dll")]
+    public static extern bool GetCursorPos(out POINT lpPoint);
+}
+"@
+\n`);
+
+const robot = {
+  getScreenSize: () => ({ width: 1920, height: 1080 }),
+  
+  // Batched movement processing for smoother cursor control
+  processPendingMovements: () => {
+    if (pendingMovements.length === 0) return;
+    
+    // Accumulate all pending movements
+    let totalDeltaX = 0;
+    let totalDeltaY = 0;
+    
+    for (const movement of pendingMovements) {
+      totalDeltaX += movement.deltaX;
+      totalDeltaY += movement.deltaY;
+    }
+    
+    // Clear pending movements
+    pendingMovements = [];
+    
+    // Apply direct movement with optimized sensitivity for minimal latency
+    const smoothedDeltaX = Math.round(totalDeltaX * 1.5); // Reduced from 2.2x for precision
+    const smoothedDeltaY = Math.round(totalDeltaY * 1.5);
+    
+    if (Math.abs(smoothedDeltaX) > 0 || Math.abs(smoothedDeltaY) > 0) {
+      // Ultra-fast PowerShell command with minimal overhead
+      const cmd = `$p=[System.Windows.Forms.Cursor]::Position;$p.X+=[Math]::Max(-50,[Math]::Min(50,${smoothedDeltaX}));$p.Y+=[Math]::Max(-50,[Math]::Min(50,${smoothedDeltaY}));[System.Windows.Forms.Cursor]::Position=$p\n`;
       
-      const cmd = `
-        try {
-          Add-Type -TypeDefinition @"
+      try {
+        psProcess.stdin.write(cmd);
+        // Removed console.log for performance
+      } catch (error) {
+        console.log('Movement error:', error);
+      }
+    }
+  },
+  
+  moveMouse: (deltaX, deltaY) => {
+    // Add to pending movements
+    pendingMovements.push({ deltaX, deltaY });
+    
+    // Process immediately for ultra-low latency (no setImmediate delay)
+    if (pendingMovements.length === 1) {
+      robot.processPendingMovements();
+    }
+    
+    // Clear any existing timer and start fresh
+    if (movementTimer) {
+      clearTimeout(movementTimer);
+    }
+    
+    // Start batch timer for rapid movements
+    movementTimer = setTimeout(() => {
+      robot.processPendingMovements();
+      movementTimer = null;
+    }, MOVEMENT_BATCH_DELAY);
+  },
+  mouseClick: (button) => {
+    console.log(`Attempting mouse click: ${button}`);
+    const isLeft = button === 'left';
+    const downFlag = isLeft ? 0x0002 : 0x0008;  // LEFTDOWN or RIGHTDOWN
+    const upFlag = isLeft ? 0x0004 : 0x0010;    // LEFTUP or RIGHTUP
+    
+    const cmd = `
+      try {
+        Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public class MouseSim {
@@ -63,39 +119,147 @@ public class MouseSim {
     public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
 }
 "@
-          [MouseSim]::mouse_event(${downFlag}, 0, 0, 0, [IntPtr]::Zero);
-          Start-Sleep -Milliseconds 50;
-          [MouseSim]::mouse_event(${upFlag}, 0, 0, 0, [IntPtr]::Zero);
-          Write-Host "Mouse click executed: ${button}"
-        } catch {
-          Write-Host "Error in mouse click: \$_"
-        }
-      `;
-      try {
-        psProcess.stdin.write(cmd + '\n');
-        console.log(`PowerShell command sent for ${button} click`);
-      } catch (error) {
-        console.log('Error writing to PowerShell stdin:', error);
+        [MouseSim]::mouse_event(${downFlag}, 0, 0, 0, [IntPtr]::Zero);
+        Start-Sleep -Milliseconds 50;
+        [MouseSim]::mouse_event(${upFlag}, 0, 0, 0, [IntPtr]::Zero);
+        Write-Host "Mouse click executed: ${button}"
+      } catch {
+        Write-Host "Error in mouse click: \$_"
       }
-    },
-    keyToggle: (key, action) => {
-      const keyMap = {
-        'up': '{UP}',
-        'down': '{DOWN}',
-        'left': '{LEFT}',
-        'right': '{RIGHT}',
-        'a': 'a',
-        'space': ' ',
-        'enter': '{ENTER}'
-      };
-      if (keyMap[key]) {
-        const cmd = `[System.Windows.Forms.SendKeys]::SendWait('${keyMap[key]}')\n`;
-        psProcess.stdin.write(cmd);
-      }
+    `;
+    try {
+      psProcess.stdin.write(cmd + '\n');
+      console.log(`PowerShell command sent for ${button} click`);
+    } catch (error) {
+      console.log('Error writing to PowerShell stdin:', error);
     }
-  };
-} // Uncomment after fixing compilation
-const os = require('os');
+  },
+  keyToggle: (key, action) => {
+    const keyMap = {
+      'up': '{UP}',
+      'down': '{DOWN}',
+      'left': '{LEFT}',
+      'right': '{RIGHT}',
+      'a': 'a',
+      'space': ' ',
+      'enter': '{ENTER}'
+    };
+    if (keyMap[key]) {
+      const cmd = `[System.Windows.Forms.SendKeys]::SendWait('${keyMap[key]}')\n`;
+      psProcess.stdin.write(cmd);
+    }
+  },
+  scrollMouse: (delta) => {
+    console.log(`Scrolling mouse: ${delta}`);
+    const scrollAmount = Math.round(delta / 120); // Convert to scroll units
+    const cmd = `
+      try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class MouseScroll {
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, uint dx, uint dy, int dwData, IntPtr dwExtraInfo);
+}
+"@
+        [MouseScroll]::mouse_event(0x0800, 0, 0, ${scrollAmount * 120}, [IntPtr]::Zero);
+        Write-Host "Mouse scroll executed: ${scrollAmount}"
+      } catch {
+        Write-Host "Error in mouse scroll: \$_"
+      }
+    `;
+    try {
+      psProcess.stdin.write(cmd + '\n');
+      console.log(`PowerShell scroll command sent: ${scrollAmount}`);
+    } catch (error) {
+      console.log('Error writing scroll to PowerShell stdin:', error);
+    }
+  },
+
+  sendKey: (key, modifiers) => {
+    console.log(`Sending key: ${key} with modifiers:`, modifiers);
+
+    // Handle special keys
+    const specialKeys = {
+      'Tab': '{TAB}',
+      'Enter': '{ENTER}',
+      'Backspace': '{BACKSPACE}',
+      ' ': ' '
+    };
+
+    let keyCommand = specialKeys[key] || key;
+
+    // Add modifiers
+    if (modifiers.includes('Shift')) {
+      keyCommand = `+${keyCommand}`;
+    }
+
+    const cmd = `[System.Windows.Forms.SendKeys]::SendWait('${keyCommand}')\n`;
+
+    try {
+      psProcess.stdin.write(cmd);
+      console.log(`Keyboard command sent: ${keyCommand}`);
+    } catch (error) {
+      console.log('Error sending keyboard command:', error);
+    }
+  },
+
+  sendShortcut: (modifiers, key) => {
+    console.log(`Sending shortcut: ${modifiers.join('+')}+${key}`);
+
+    // Map modifier names to SendKeys format
+    const modifierMap = {
+      'Control': '^',
+      'Alt': '%',
+      'Shift': '+'
+    };
+
+    let shortcutCommand = '';
+    
+    // Add modifiers
+    modifiers.forEach(mod => {
+      if (modifierMap[mod]) {
+        shortcutCommand += modifierMap[mod];
+      }
+    });
+
+    // Handle special keys
+    const specialKeys = {
+      '{F4}': '{F4}',
+      'c': 'c',
+      'v': 'v',
+      'z': 'z',
+      'y': 'y',
+      'a': 'a',
+      's': 's',
+      'r': 'r'
+    };
+
+    shortcutCommand += specialKeys[key] || key;
+
+    const cmd = `[System.Windows.Forms.SendKeys]::SendWait('${shortcutCommand}')\n`;
+
+    try {
+      psProcess.stdin.write(cmd);
+      console.log(`Shortcut command sent: ${shortcutCommand}`);
+    } catch (error) {
+      console.log('Error sending shortcut command:', error);
+    }
+  },
+
+  handlePinchGesture: (direction, delta) => {
+    console.log(`Pinch gesture: ${direction}, delta: ${delta}`);
+    
+    // Convert pinch to zoom shortcut
+    if (direction === 'in') {
+      // Zoom in (Ctrl + Plus)
+      robot.sendShortcut(['Control'], '{ADD}');
+    } else if (direction === 'out') {
+      // Zoom out (Ctrl + Minus)
+      robot.sendShortcut(['Control'], '{SUBTRACT}');
+    }
+  }
+};
 
 app.use(express.static('public'));
 
@@ -129,6 +293,11 @@ socket.on('input', (msg) => {
   handleInput(msg);
 });
 
+// Handle ping for connection quality monitoring
+socket.on('ping', (data) => {
+  socket.emit('pong', { timestamp: data.timestamp });
+});
+
 function handleInput(msg) {
   console.log('Received input:', msg);
   if (msg.type === 'button') {
@@ -144,12 +313,22 @@ function handleInput(msg) {
     }
   } else if (msg.type === 'mouse') {
     if (msg.action === 'move') {
-      const screenSize = robot.getScreenSize();
-      const x = Math.round(msg.data.x * screenSize.width / 400);
-      const y = Math.round(msg.data.y * screenSize.height / 300);
-      robot.moveMouse(x, y);
+      // Direct delta movement for optimal smoothness
+      robot.moveMouse(msg.data.x, msg.data.y);
     } else if (msg.action === 'click') {
       robot.mouseClick(msg.data);
+    } else if (msg.action === 'scroll') {
+      robot.scrollMouse(msg.data.delta);
+    }
+  } else if (msg.type === 'keyboard') {
+    if (msg.action === 'key') {
+      robot.sendKey(msg.data.key, msg.data.modifiers || []);
+    } else if (msg.action === 'shortcut') {
+      robot.sendShortcut(msg.data.modifiers || [], msg.data.key);
+    }
+  } else if (msg.type === 'gesture') {
+    if (msg.action === 'pinch') {
+      robot.handlePinchGesture(msg.data.direction, msg.data.delta);
     }
   }
 }
@@ -163,6 +342,9 @@ server.listen(3001, '0.0.0.0', () => {
 
 // Cleanup on exit
 process.on('exit', () => {
+  if (movementTimer) {
+    clearTimeout(movementTimer);
+  }
   if (psProcess) {
     psProcess.stdin.end();
     psProcess.kill();
@@ -170,6 +352,9 @@ process.on('exit', () => {
 });
 
 process.on('SIGINT', () => {
+  if (movementTimer) {
+    clearTimeout(movementTimer);
+  }
   if (psProcess) {
     psProcess.stdin.end();
     psProcess.kill();
